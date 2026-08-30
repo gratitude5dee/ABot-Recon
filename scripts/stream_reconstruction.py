@@ -16,6 +16,21 @@ recent window of them. After each window the streamer writes, into
   the same binary PLY layout ``export_reconstruction_ply.py`` writes, small
   enough for a browser to fetch directly.
 
+Every ``infer()`` call reconstructs its window in a fresh local frame, so
+consecutive windows are stitched into one persistent stream frame: the poses
+each pass produces for frames shared with the previous pass are aligned onto
+the previous pass's (already-stitched) poses — Umeyama on the shared camera
+centers when there are enough, a single shared pose pair otherwise — and the
+resulting similarity is applied to the pass's poses and world points before
+anything is published.
+
+Frames are admitted only once they are *stable* (same inode/size/mtime across
+two consecutive scans) and decodable, so a file the recorder is still writing
+is never fed to the model; a frame that fails to decode is retried on later
+scans instead of killing the daemon. Frame identity (not just the file name)
+is tracked, so a recorder restart that rewrites the same names is detected
+and treated as all-new footage.
+
 Read-only by construction: the only input is a directory of image files. This
 process never talks to the robot.
 
@@ -36,6 +51,7 @@ import os
 import signal
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -77,25 +93,62 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def list_frames(image_dir: Path) -> list[Path]:
-    """Sorted image files; sorted order is capture order for zero-padded names."""
+@dataclass(frozen=True)
+class Frame:
+    """One admitted image file, identified by content identity, not just name:
+    a recorder restart that rewrites ``000001.jpg`` yields a different Frame."""
+
+    path: Path
+    ino: int
+    size: int
+    mtime_ns: int
+
+    @property
+    def key(self) -> tuple[str, int, int, int]:
+        return (self.path.name, self.ino, self.size, self.mtime_ns)
+
+
+def scan_frames(image_dir: Path) -> list[Frame]:
+    """Sorted snapshot of the image files currently in the directory."""
     if not image_dir.is_dir():
         return []
-    return sorted(
-        path
-        for path in image_dir.iterdir()
-        if path.suffix.lower() in IMAGE_SUFFIXES and path.is_file()
-    )
+    frames = []
+    for path in sorted(image_dir.iterdir()):
+        if path.suffix.lower() not in IMAGE_SUFFIXES:
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue  # deleted between listing and stat
+        if not path.is_file():
+            continue
+        frames.append(
+            Frame(path=path, ino=stat.st_ino, size=stat.st_size, mtime_ns=stat.st_mtime_ns)
+        )
+    return frames
+
+
+def stable_frames(previous: dict[str, Frame], current: list[Frame]) -> list[Frame]:
+    """Frames whose identity survived one full scan interval unchanged.
+
+    A file the recorder is mid-write on either grows (size/mtime changes) or
+    is brand new; both are held back until the next scan confirms them.
+    """
+    return [
+        frame for frame in current if previous.get(frame.path.name) == frame
+    ]
 
 
 def select_window(
-    frames: list[Path], window: int, last_newest: Path | None, min_new: int
-) -> list[Path] | None:
+    frames: list[Frame], window: int, last_newest: Frame | None, min_new: int
+) -> list[Frame] | None:
     """The trailing window to reconstruct, or None when too little is new.
 
     ``last_newest`` is the newest frame of the previous pass; a pass runs only
     once at least ``min_new`` frames arrived after it, so a stalled recorder
-    does not burn GPU re-reconstructing the same clip.
+    does not burn GPU re-reconstructing the same clip. Identity comparison
+    means a recorder restart that rewrote the same file names counts as
+    all-new footage.
     """
     if len(frames) < 2:
         return None
@@ -105,8 +158,96 @@ def select_window(
             if newness < max(1, min_new):
                 return None
         except ValueError:
-            pass  # the recorder restarted; everything is new
+            pass  # the recorder restarted or rewrote files; everything is new
     return frames[-window:] if window > 0 else frames
+
+
+def umeyama_similarity(src: np.ndarray, dst: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+    """Least-squares similarity (s, R, t) with ``dst ≈ s·R·src + t``.
+
+    Umeyama (1991). Raises ``ValueError`` when the point sets are too few or
+    too degenerate (rank < 2) to determine a rotation.
+    """
+    src = np.asarray(src, dtype=np.float64)
+    dst = np.asarray(dst, dtype=np.float64)
+    if src.shape != dst.shape or src.ndim != 2 or src.shape[1] != 3:
+        raise ValueError(f"expected matching Nx3 sets, received {src.shape} and {dst.shape}")
+    n = len(src)
+    if n < 3:
+        raise ValueError("need at least 3 correspondences")
+    mu_src = src.mean(axis=0)
+    mu_dst = dst.mean(axis=0)
+    src_c = src - mu_src
+    dst_c = dst - mu_dst
+    cov = dst_c.T @ src_c / n
+    u, d, vt = np.linalg.svd(cov)
+    if np.linalg.matrix_rank(cov) < 2:
+        raise ValueError("degenerate correspondences (rank < 2)")
+    s_fix = np.eye(3)
+    if np.linalg.det(u) * np.linalg.det(vt) < 0:
+        s_fix[2, 2] = -1.0
+    rotation = u @ s_fix @ vt
+    var_src = (src_c**2).sum() / n
+    if var_src <= 0:
+        raise ValueError("zero-variance source points")
+    scale = float((d * np.diag(s_fix)).sum() / var_src)
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError(f"non-positive similarity scale {scale}")
+    translation = mu_dst - scale * rotation @ mu_src
+    return scale, rotation, translation
+
+
+def alignment_from_overlap(
+    stream_poses: dict[tuple, np.ndarray],
+    window_keys: list[tuple],
+    new_poses: np.ndarray,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """Similarity mapping this pass's local frame onto the persistent stream
+    frame, from the poses of frames shared with the previous pass.
+
+    Umeyama on the shared camera centers when there are ≥3 and they are
+    non-degenerate; otherwise the newest shared pose pair fixes a rigid
+    (scale-1) transform. With no overlap at all the pass keeps its own frame
+    (identity) — the first pass, or a stream discontinuity after a recorder
+    restart.
+    """
+    overlap = [
+        (index, key) for index, key in enumerate(window_keys) if key in stream_poses
+    ]
+    if not overlap:
+        return 1.0, np.eye(3), np.zeros(3)
+    if len(overlap) >= 3:
+        src = np.array([new_poses[i][:3, 3] for i, _ in overlap])
+        dst = np.array([stream_poses[k][:3, 3] for _, k in overlap])
+        try:
+            return umeyama_similarity(src, dst)
+        except ValueError:
+            pass  # nearly-stationary camera; fall through to the pose pair
+    index, key = overlap[-1]
+    prev = stream_poses[key]
+    new = np.asarray(new_poses[index], dtype=np.float64)
+    rotation = prev[:3, :3] @ new[:3, :3].T
+    translation = prev[:3, 3] - rotation @ new[:3, 3]
+    return 1.0, rotation, translation
+
+
+def apply_similarity_to_pose(
+    pose: np.ndarray, scale: float, rotation: np.ndarray, translation: np.ndarray
+) -> np.ndarray:
+    """Map a cam-to-world pose into the stream frame, keeping the rotation
+    block orthonormal (scale moves only the center)."""
+    pose = np.asarray(pose, dtype=np.float64)
+    out = np.eye(4)
+    out[:3, :3] = rotation @ pose[:3, :3]
+    out[:3, 3] = scale * rotation @ pose[:3, 3] + translation
+    return out
+
+
+def apply_similarity_to_points(
+    points: np.ndarray, scale: float, rotation: np.ndarray, translation: np.ndarray
+) -> np.ndarray:
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    return (scale * (rotation @ pts.T).T + translation).astype(np.float32)
 
 
 def pose_record_from_matrix(matrix: np.ndarray) -> dict:
@@ -190,7 +331,7 @@ def write_chunk_ply(path: Path, points: np.ndarray, colors: np.ndarray) -> None:
 
 def run(args: argparse.Namespace) -> int:
     import torch
-    from PIL import Image
+    from PIL import Image, UnidentifiedImageError
 
     from abot_recon import ABotRecon
     from abot_recon.preprocessing import preprocess_image
@@ -210,12 +351,36 @@ def run(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
 
+    def decodable(frame: Frame) -> bool:
+        try:
+            with Image.open(frame.path) as image:
+                image.verify()
+            return True
+        except (OSError, UnidentifiedImageError, SyntaxError) as error:
+            print(f"skipping undecodable {frame.path.name}: {error}", file=sys.stderr)
+            return False
+
     points_dir = args.output_dir / "points"
     seq = 0
-    last_newest: Path | None = None
+    last_newest: Frame | None = None
+    previous_scan: dict[str, Frame] = {}
+    verified: set[tuple] = set()
+    stream_poses: dict[tuple, np.ndarray] = {}
 
     while not stop["requested"]:
-        frames = list_frames(args.image_dir)
+        scan = scan_frames(args.image_dir)
+        candidates = stable_frames(previous_scan, scan)
+        previous_scan = {frame.path.name: frame for frame in scan}
+        frames = []
+        for frame in candidates:
+            if frame.key not in verified:
+                if not decodable(frame):
+                    continue  # retried next scan; the recorder may still fix it
+                verified.add(frame.key)
+            frames.append(frame)
+        if len(verified) > 4096:
+            verified = {frame.key for frame in frames}
+
         window = select_window(frames, args.window, last_newest, args.min_new_frames)
         if window is None:
             if args.once:
@@ -224,24 +389,41 @@ def run(args: argparse.Namespace) -> int:
             time.sleep(args.poll_interval)
             continue
 
-        result = model.infer(
-            window,
-            output_local_points=True,
-            output_world_points=True,
-            output_confidence=False,
-            loop_closure=False,
-        )
+        try:
+            result = model.infer(
+                [frame.path for frame in window],
+                output_local_points=True,
+                output_world_points=True,
+                output_confidence=False,
+                loop_closure=False,
+            )
+        except (OSError, UnidentifiedImageError) as error:
+            # A frame vanished or went bad between admission and the pass;
+            # drop its verification and try again on the next scan.
+            print(f"window failed to load, retrying: {error}", file=sys.stderr)
+            verified.difference_update(frame.key for frame in window)
+            time.sleep(args.poll_interval)
+            continue
         seq += 1
         last_newest = window[-1]
 
-        poses = result.camera_poses.cpu().numpy()
-        pose = pose_record_from_matrix(poses[-1])
+        poses = result.camera_poses.cpu().numpy().astype(np.float64)
+        window_keys = [frame.key for frame in window]
+        scale, rotation, translation = alignment_from_overlap(
+            stream_poses, window_keys, poses
+        )
+        aligned = [
+            apply_similarity_to_pose(pose, scale, rotation, translation)
+            for pose in poses
+        ]
+        stream_poses = dict(zip(window_keys, aligned))
+        pose = pose_record_from_matrix(aligned[-1])
 
         batch_name = None
         if result.world_points is not None:
             colors = []
-            for frame_path in window:
-                with Image.open(frame_path) as image:
+            for frame in window:
+                with Image.open(frame.path) as image:
                     tensor, _ = preprocess_image(image)
                 colors.append(
                     (tensor.clamp(0, 1) * 255)
@@ -256,6 +438,7 @@ def run(args: argparse.Namespace) -> int:
                 args.point_stride,
                 args.max_points,
             )
+            pts = apply_similarity_to_points(pts, scale, rotation, translation)
             batch_name = f"points/batch_{seq:06d}.ply"
             write_chunk_ply(points_dir / f"batch_{seq:06d}.ply", pts, cols)
 
@@ -266,7 +449,7 @@ def run(args: argparse.Namespace) -> int:
                 "t": int(time.time() * 1000),
                 "pose": pose,
                 "batch": batch_name,
-                "window": {"frames": len(window), "newest": window[-1].name},
+                "window": {"frames": len(window), "newest": window[-1].path.name},
             },
         )
         print(f"window {seq}: {len(window)} frames → {batch_name or 'pose only'}")
