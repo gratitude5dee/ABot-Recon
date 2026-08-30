@@ -427,7 +427,7 @@ def run(args: argparse.Namespace) -> int:
                         .permute(1, 2, 0)
                         .numpy()
                     )
-        except (OSError, UnidentifiedImageError) as error:
+        except (OSError, UnidentifiedImageError, SyntaxError) as error:
             # A frame vanished or went bad between admission and the pass;
             # drop its verification and try again on the next scan. Nothing
             # is committed until every read for the pass has succeeded.
