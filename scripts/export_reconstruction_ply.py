@@ -28,6 +28,17 @@ def parse_args() -> argparse.Namespace:
         help="Coordinate frame of --points; auto infers it from the filename",
     )
     parser.add_argument("--metadata", type=Path, help="metadata.json with dense_output_indices")
+    parser.add_argument(
+        "--metric-scale",
+        type=float,
+        default=1.0,
+        help="Uniform scale applied to points and pose translations (SLAM units -> meters)",
+    )
+    parser.add_argument(
+        "--poses-output",
+        type=Path,
+        help="Optional .npy path for the (scaled) camera poses actually exported",
+    )
     parser.add_argument("--confidence", type=Path, help="Optional confidence.pt")
     parser.add_argument("--confidence-threshold", type=float, default=None)
     parser.add_argument("--point-stride", type=int, default=4, help="Sample every N pixels")
@@ -157,6 +168,8 @@ def prepare_points(
         if args.colors is not None:
             raise ValueError("--colors is not used when --points is already an RGB PLY")
         points, colors = load_rgb_ply(args.points)
+        if args.metric_scale != 1.0:
+            points = points * np.float32(args.metric_scale)
         if args.max_points > 0 and len(points) > args.max_points:
             keep = np.linspace(0, len(points) - 1, args.max_points, dtype=np.int64)
             points, colors = points[keep], colors[keep]
@@ -220,6 +233,8 @@ def prepare_points(
             conf = confidence[dense_index, :: args.point_stride, :: args.point_stride]
             valid &= conf.numpy().reshape(-1) >= args.confidence_threshold
         flat = flat[valid]
+        if args.metric_scale != 1.0:
+            flat = flat * args.metric_scale
         if coordinate_frame == "local" and len(flat):
             pose = poses[pose_indices[dense_index]]
             flat = flat @ pose[:3, :3].T + pose[:3, 3]
@@ -411,12 +426,24 @@ def main() -> None:
     if args.bev_output is not None and args.poses is None:
         raise SystemExit("--bev-output requires --poses")
 
+    if args.metric_scale <= 0 or not np.isfinite(args.metric_scale):
+        raise SystemExit("--metric-scale must be a positive finite number")
+    if args.poses_output is not None and args.poses is None:
+        raise SystemExit("--poses-output requires --poses")
+
     poses = load_poses(args.poses)
+    if poses is not None and args.metric_scale != 1.0:
+        poses = poses.copy()
+        poses[:, :3, 3] *= args.metric_scale
     points, point_colors = prepare_points(args, poses)
     empty_edges = np.empty((0, 2), dtype=np.int32)
     empty_edge_colors = np.empty((0, 3), dtype=np.uint8)
     write_binary_ply(args.output, points, point_colors, empty_edges, empty_edge_colors)
     print(f"Wrote {args.output}: {len(points):,} RGB points")
+    if args.poses_output is not None:
+        args.poses_output.parent.mkdir(parents=True, exist_ok=True)
+        np.save(args.poses_output, poses.astype(np.float32))
+        print(f"Wrote {args.poses_output}: {len(poses):,} poses (scale {args.metric_scale:g})")
     if args.bev_output is not None:
         plane = write_bev(args.bev_output, poses, args.bev_size, args.bev_plane)
         print(f"Wrote {args.bev_output}: {len(poses):,} poses on the {plane.upper()} plane")
