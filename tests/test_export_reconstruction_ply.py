@@ -88,11 +88,14 @@ def test_estimate_metric_scale_recovers_camera_height(tmp_path):
     floor[:, :2] = rng.uniform(-1, 1, size=(5000, 2))
     clutter = rng.uniform(-1, 1, size=(500, 3)) + np.array([0, 0, 0.3])
     points = np.concatenate([floor, clutter]).astype(np.float64)
-    normal, offset, inliers = estimate.dominant_plane(points, 200, 0.01, seed=0)
+    planes = estimate.candidate_planes(points, 200, 0.01, seed=0)
+    centers = np.tile(np.array([[0.0, 0.0, 0.5]]), (10, 1))
+    centers[:, 0] = np.linspace(-0.5, 0.5, 10)
+    normal, offset, inliers, heights = estimate.select_floor_plane(
+        planes, centers, max_height_cv=0.05
+    )
     assert inliers >= len(floor) * 0.95
-    camera = np.array([[0.0, 0.0, 0.5]])
-    height = np.abs(camera.dot(normal) + offset)[0]
-    assert height == pytest.approx(0.5, abs=0.02)
+    assert heights.mean() == pytest.approx(0.5, abs=0.02)
 
 
 def test_rejects_nonpositive_metric_scale(tmp_path, monkeypatch, capsys):

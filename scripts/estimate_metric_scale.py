@@ -2,9 +2,15 @@
 """Estimate a SLAM-units -> meters scale from the camera height above the floor plane.
 
 Monocular reconstructions are up-to-scale. When the camera rode at a known height
-above a flat floor (e.g. a robot head camera), the dominant plane in the dense
+above a flat floor (e.g. a robot head camera), the floor plane in the dense
 points recovers that height in SLAM units, and the ratio gives a metric scale
 usable with export_reconstruction_ply.py --metric-scale.
+
+The floor is not assumed to be the largest plane: walls can hold more points.
+Among the top RANSAC candidates, the floor is the plane the cameras keep an
+essentially constant distance from across the whole trajectory (the camera
+rode at fixed height); planes whose camera distances vary too much are
+rejected, and the run fails if no candidate is consistent.
 """
 
 from __future__ import annotations
@@ -30,17 +36,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ransac-iters", type=int, default=500)
     parser.add_argument("--inlier-threshold", type=float, default=0.01)
     parser.add_argument("--min-inlier-fraction", type=float, default=0.3)
+    parser.add_argument(
+        "--max-height-cv",
+        type=float,
+        default=0.05,
+        help="Max coefficient of variation of camera-to-plane distance for a "
+        "candidate plane to count as the floor",
+    )
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
 
-def dominant_plane(
-    points: np.ndarray, iterations: int, threshold: float, seed: int
-) -> tuple[np.ndarray, float, int]:
+def candidate_planes(
+    points: np.ndarray,
+    iterations: int,
+    threshold: float,
+    seed: int,
+    max_candidates: int = 8,
+) -> list[tuple[np.ndarray, float, int]]:
+    """Top RANSAC planes as (normal, offset, inliers), best-supported first.
+
+    Near-duplicates (parallel normals at nearly the same offset) collapse into
+    the better-supported hypothesis so distinct surfaces each get one slot.
+    """
     rng = np.random.default_rng(seed)
-    best_inliers = -1
-    best_normal = None
-    best_offset = 0.0
+    candidates: list[tuple[np.ndarray, float, int]] = []
     for _ in range(iterations):
         a, b, c = points[rng.choice(len(points), 3, replace=False)]
         normal = np.cross(b - a, c - a)
@@ -50,17 +70,67 @@ def dominant_plane(
         normal = normal / norm
         offset = -normal.dot(a)
         inliers = int((np.abs(points.dot(normal) + offset) < threshold).sum())
-        if inliers > best_inliers:
-            best_inliers, best_normal, best_offset = inliers, normal, offset
-    if best_normal is None:
+        for i, (n, d, existing) in enumerate(candidates):
+            if abs(normal.dot(n)) > 0.995 and abs(abs(offset) - abs(d)) < 3 * threshold:
+                if inliers > existing:
+                    candidates[i] = (normal, offset, inliers)
+                break
+        else:
+            candidates.append((normal, offset, inliers))
+    if not candidates:
         raise SystemExit("Could not fit a plane: degenerate points")
-    return best_normal, best_offset, best_inliers
+    # In-place replacement can drift a slot toward a neighbour, so merge
+    # near-duplicates once more, best-supported first.
+    candidates.sort(key=lambda item: -item[2])
+    merged: list[tuple[np.ndarray, float, int]] = []
+    for normal, offset, inliers in candidates:
+        if any(
+            abs(normal.dot(n)) > 0.995 and abs(abs(offset) - abs(d)) < 3 * threshold
+            for n, d, _ in merged
+        ):
+            continue
+        merged.append((normal, offset, inliers))
+    return merged[:max_candidates]
+
+
+def select_floor_plane(
+    candidates: list[tuple[np.ndarray, float, int]],
+    centers: np.ndarray,
+    max_height_cv: float,
+) -> tuple[np.ndarray, float, int, np.ndarray]:
+    """Pick the candidate the cameras stay a constant distance from.
+
+    A fixed-height camera keeps a near-constant distance to the floor but a
+    varying distance to walls it moves along; of the candidates whose distance
+    spread stays under `max_height_cv`, the best-supported wins, and none
+    qualifying is a hard failure.
+    """
+    best = None
+    best_cv = np.inf
+    for normal, offset, inliers in candidates:
+        heights = np.abs(centers.dot(normal) + offset)
+        mean = heights.mean()
+        if mean < 1e-9:
+            continue
+        cv = heights.std() / mean
+        best_cv = min(best_cv, cv)
+        if cv > max_height_cv:
+            continue
+        if best is None or inliers > best[2]:
+            best = (normal, offset, inliers, heights)
+    if best is None:
+        raise SystemExit(
+            "No candidate plane keeps a consistent camera distance "
+            f"(best coefficient of variation {best_cv:.3f} > {max_height_cv:g}); "
+            "cannot identify the floor reliably"
+        )
+    return best
 
 
 def main() -> None:
     args = parse_args()
-    if args.camera_height_m <= 0:
-        raise SystemExit("--camera-height-m must be positive")
+    if not np.isfinite(args.camera_height_m) or args.camera_height_m <= 0:
+        raise SystemExit("--camera-height-m must be a positive finite number")
 
     points = torch.load(args.points, map_location="cpu", weights_only=True)
     points = points.reshape(-1, 3).numpy().astype(np.float64)
@@ -78,14 +148,16 @@ def main() -> None:
         raise SystemExit(f"Expected poses with shape [N,4,4], got {poses.shape}")
     centers = poses[:, :3, 3]
 
-    normal, offset, inliers = dominant_plane(
+    planes = candidate_planes(
         points, args.ransac_iters, args.inlier_threshold, args.seed
     )
+    normal, offset, inliers, heights = select_floor_plane(
+        planes, centers, args.max_height_cv
+    )
     fraction = inliers / len(points)
-    heights = np.abs(centers.dot(normal) + offset)
     scale = args.camera_height_m / heights.mean()
 
-    print(f"plane inliers: {inliers:,}/{len(points):,} ({fraction:.1%})")
+    print(f"floor plane inliers: {inliers:,}/{len(points):,} ({fraction:.1%})")
     print(
         "camera height above plane (SLAM units): "
         f"mean {heights.mean():.4f}, min {heights.min():.4f}, max {heights.max():.4f}"
@@ -93,7 +165,7 @@ def main() -> None:
     print(f"metric scale: {scale:.6f}")
     if fraction < args.min_inlier_fraction:
         raise SystemExit(
-            f"Dominant plane holds only {fraction:.1%} of points "
+            f"Floor plane holds only {fraction:.1%} of points "
             f"(< {args.min_inlier_fraction:.0%}); scale estimate is unreliable"
         )
 
