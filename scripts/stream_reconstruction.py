@@ -142,23 +142,36 @@ def stable_frames(previous: dict[str, Frame], current: list[Frame]) -> list[Fram
 def select_window(
     frames: list[Frame], window: int, last_newest: Frame | None, min_new: int
 ) -> list[Frame] | None:
-    """The trailing window to reconstruct, or None when too little is new.
+    """The next window to reconstruct, or None when too little is new.
 
     ``last_newest`` is the newest frame of the previous pass; a pass runs only
     once at least ``min_new`` frames arrived after it, so a stalled recorder
     does not burn GPU re-reconstructing the same clip. Identity comparison
     means a recorder restart that rewrote the same file names counts as
     all-new footage.
+
+    When a backlog accumulated (more new frames than a window can absorb),
+    the window advances at most ``window - overlap`` frames past the previous
+    pass, so consecutive passes always share the frames coordinate stitching
+    needs; the backlog is consumed over successive passes rather than jumped
+    over.
     """
     if len(frames) < 2:
         return None
     if last_newest is not None:
         try:
-            newness = len(frames) - 1 - frames.index(last_newest)
-            if newness < max(1, min_new):
-                return None
+            index = frames.index(last_newest)
         except ValueError:
-            pass  # the recorder restarted or rewrote files; everything is new
+            # The recorder restarted or rewrote files; everything is new and
+            # there is nothing left to overlap with.
+            return frames[-window:] if window > 0 else frames
+        newness = len(frames) - 1 - index
+        if newness < max(1, min_new):
+            return None
+        if window > 0:
+            overlap = min(max(3, min_new), window - 1)
+            end = min(len(frames), index + 1 + window - overlap)
+            return frames[max(0, end - window):end]
     return frames[-window:] if window > 0 else frames
 
 
@@ -367,7 +380,9 @@ def run(args: argparse.Namespace) -> int:
     verified: set[tuple] = set()
     stream_poses: dict[tuple, np.ndarray] = {}
 
+    scans = 0
     while not stop["requested"]:
+        scans += 1
         scan = scan_frames(args.image_dir)
         candidates = stable_frames(previous_scan, scan)
         previous_scan = {frame.path.name: frame for frame in scan}
@@ -383,7 +398,9 @@ def run(args: argparse.Namespace) -> int:
 
         window = select_window(frames, args.window, last_newest, args.min_new_frames)
         if window is None:
-            if args.once:
+            # Stability needs a confirming scan, so one-shot mode only
+            # concludes "empty" after the second scan has had its chance.
+            if args.once and scans >= 2:
                 print("nothing to reconstruct", file=sys.stderr)
                 return 1
             time.sleep(args.poll_interval)
@@ -397,9 +414,23 @@ def run(args: argparse.Namespace) -> int:
                 output_confidence=False,
                 loop_closure=False,
             )
-        except (OSError, UnidentifiedImageError) as error:
+            colors = None
+            if result.world_points is not None:
+                colors = []
+                for frame in window:
+                    with Image.open(frame.path) as image:
+                        tensor, _ = preprocess_image(image)
+                    colors.append(
+                        (tensor.clamp(0, 1) * 255)
+                        .round()
+                        .to(torch.uint8)
+                        .permute(1, 2, 0)
+                        .numpy()
+                    )
+        except (OSError, UnidentifiedImageError, SyntaxError) as error:
             # A frame vanished or went bad between admission and the pass;
-            # drop its verification and try again on the next scan.
+            # drop its verification and try again on the next scan. Nothing
+            # is committed until every read for the pass has succeeded.
             print(f"window failed to load, retrying: {error}", file=sys.stderr)
             verified.difference_update(frame.key for frame in window)
             time.sleep(args.poll_interval)
@@ -420,18 +451,7 @@ def run(args: argparse.Namespace) -> int:
         pose = pose_record_from_matrix(aligned[-1])
 
         batch_name = None
-        if result.world_points is not None:
-            colors = []
-            for frame in window:
-                with Image.open(frame.path) as image:
-                    tensor, _ = preprocess_image(image)
-                colors.append(
-                    (tensor.clamp(0, 1) * 255)
-                    .round()
-                    .to(torch.uint8)
-                    .permute(1, 2, 0)
-                    .numpy()
-                )
+        if colors is not None:
             pts, cols = decimate_points(
                 result.world_points.cpu().numpy(),
                 np.stack(colors),

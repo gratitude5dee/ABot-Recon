@@ -48,11 +48,29 @@ def test_windows_wait_for_enough_new_frames(tmp_path):
 
     frames = frames + touch_frames(tmp_path, 2, start=13)
     again = stream.select_window(frames, 6, last_newest=first[-1], min_new=4)
-    assert again == frames[-6:]
+    assert again == frames[6:12]
+    assert len(set(again) & set(first)) == 4  # stitching overlap survives
 
     # A recorder restart (previous newest gone) counts everything as new.
     gone = stream.Frame(path=Path("gone.jpg"), ino=0, size=0, mtime_ns=0)
     assert stream.select_window(frames[-3:], 6, last_newest=gone, min_new=4)
+
+
+def test_backlog_is_consumed_in_overlapping_windows(tmp_path):
+    # A pass ended at index 5, then 30 frames of backlog piled up. Each
+    # subsequent window must still overlap the previous pass rather than
+    # jumping to the newest frames in an unrelated coordinate frame.
+    frames = touch_frames(tmp_path, 36)
+    last = frames[5]
+    seen = frames[:6]
+    while True:
+        window = stream.select_window(frames, 6, last_newest=last, min_new=2)
+        if window is None:
+            break
+        assert set(window) & set(seen), "window lost overlap with the stream"
+        seen = window
+        last = window[-1]
+    assert last == frames[-1], "backlog was never fully consumed"
 
 
 def test_rewritten_last_newest_counts_as_a_restart(tmp_path):
