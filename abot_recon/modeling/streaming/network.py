@@ -661,7 +661,7 @@ class ABotReconNetwork(Pi3):
             conf_hidden = self.conf_decoder(hidden, xpos=pos)
         camera_hidden = self.camera_decoder(hidden, xpos=pos)
 
-        with torch.amp.autocast(device_type="cuda", enabled=False):
+        with torch.amp.autocast(device_type=hidden.device.type, enabled=False):
             point_hidden = point_hidden.float()
             ret = self.point_head([point_hidden[:, self.patch_start_idx :]], (H, W)).reshape(
                 B, N, H, W, -1
@@ -1085,7 +1085,7 @@ class ABotReconNetwork(Pi3):
         conf_hidden = self.conf_decoder(hidden, xpos=pos) if self.train_conf else None
         camera_hidden = self.camera_decoder(hidden, xpos=pos)
 
-        with torch.amp.autocast(device_type="cuda", enabled=False):
+        with torch.amp.autocast(device_type=hidden.device.type, enabled=False):
             point_hidden = point_hidden.float()
             ret = self.point_head([point_hidden[:, self.patch_start_idx :]], (H, W)).reshape(
                 B, N, H, W, -1
@@ -1192,7 +1192,7 @@ class ABotReconNetwork(Pi3):
             )
 
         camera_hidden = self.camera_decoder(hidden, xpos=pos)
-        with torch.amp.autocast(device_type="cuda", enabled=False):
+        with torch.amp.autocast(device_type=hidden.device.type, enabled=False):
             camera_hidden = camera_hidden.float()
             camera_tokens_for_head = camera_hidden[:, self.patch_start_idx :]
             if (

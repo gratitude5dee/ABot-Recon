@@ -35,3 +35,9 @@ def test_cli_saves_noloop_and_loop_pose_outputs(tmp_path):
     }
     assert {path.name for path in tmp_path.iterdir()} == expected
     np.testing.assert_array_equal(np.load(tmp_path / "camera_poses_noloop.npy"), poses)
+
+
+def test_cli_quantize_flag_selects_dynamic_int8():
+    parser = build_parser()
+    assert parser.parse_args([]).quantization == "none"
+    assert parser.parse_args(["--quantize"]).quantization == "int8_dynamic"

@@ -31,13 +31,18 @@ def reference_rope2d(tokens, positions, base=100.0):
     )
 
 
+def import_curope():
+    from abot_recon.modeling.pi3.models.curope import curope2d
+
+    return curope2d
+
+
 def import_curope_or_skip():
-    try:
-        from abot_recon.modeling.pi3.models.curope import curope2d
-    except ImportError as exc:
+    curope2d = import_curope()
+    if not curope2d.kernels_available():
         if os.environ.get("ABOT_RECON_REQUIRE_CUROPE") == "1":
-            pytest.fail(f"required cuRoPE2D extension cannot be loaded: {exc}")
-        pytest.skip(f"cuRoPE2D is not compiled: {exc}")
+            pytest.fail("required cuRoPE2D extension cannot be loaded")
+        pytest.skip("cuRoPE2D is not compiled")
     return curope2d
 
 
@@ -46,6 +51,31 @@ def test_curope_uses_the_repository_local_extension():
     assert Path(curope2d._kernels.__file__).resolve().parent == Path(
         curope2d.__file__
     ).resolve().parent
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_curope_on_cpu_matches_reference_exactly(dtype):
+    cuRoPE2D = import_curope().cuRoPE2D
+    torch.manual_seed(0)
+    tokens = torch.randn(1, 4, 121, 64, dtype=dtype)
+    positions = torch.randint(0, 11, (1, 121, 2))
+    expected = reference_rope2d(tokens.clone(), positions)
+
+    actual = cuRoPE2D()(tokens.clone(), positions)
+
+    assert actual.device.type == "cpu"
+    assert torch.equal(actual, expected)
+
+
+def test_curope_cpu_inverse_undoes_the_rotation():
+    cuRoPE2D = import_curope().cuRoPE2D
+    torch.manual_seed(0)
+    tokens = torch.randn(1, 2, 49, 32)
+    positions = torch.randint(0, 7, (1, 49, 2))
+
+    roundtrip = cuRoPE2D(F0=-1.0)(cuRoPE2D()(tokens.clone(), positions), positions)
+
+    assert torch.allclose(roundtrip, tokens, atol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

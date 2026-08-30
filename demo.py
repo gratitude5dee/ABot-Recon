@@ -29,6 +29,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/demo"))
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--attention-backend", choices=("auto", "paged", "sdpa"), default="auto")
+    parser.add_argument(
+        "--quantize",
+        action="store_const",
+        const="int8_dynamic",
+        default="none",
+        dest="quantization",
+        help="dynamic INT8 decoders/heads on CPU (lower memory, some accuracy loss)",
+    )
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end", type=int)
@@ -123,6 +131,7 @@ def main() -> None:
         args.checkpoint,
         device=args.device,
         attention_backend=args.attention_backend,
+        quantization=args.quantization,
         max_frames=args.max_frames,
         loop_closure=args.loop_closure,
         loop_salad_checkpoint=args.loop_salad_checkpoint,

@@ -196,6 +196,7 @@ class ABotRecon:
                 "frames": len(paths),
                 "loop_closure": bool(use_loop),
                 "attention_backend": output.get("attention_backend", "unknown"),
+                "quantization": output.get("quantization", self.config.quantization),
                 "dense_output_indices": dense_indices,
                 "dense_outputs": {
                     "local_points": bool(local_points_enabled),

@@ -22,3 +22,14 @@ def test_explicit_paged_never_silently_falls_back(monkeypatch):
 def test_explicit_sdpa_ignores_flashinfer(monkeypatch):
     monkeypatch.setattr(model_module, "flashinfer_available", lambda: True)
     assert model_module.resolve_attention_backend("sdpa") == "sdpa"
+
+
+def test_cpu_device_resolves_to_sdpa(monkeypatch):
+    monkeypatch.setattr(model_module, "flashinfer_available", lambda: True)
+    assert model_module.resolve_attention_backend("auto", "cpu") == "sdpa"
+
+
+def test_cpu_device_rejects_explicit_paged(monkeypatch):
+    monkeypatch.setattr(model_module, "flashinfer_available", lambda: True)
+    with pytest.raises(RuntimeError, match="CUDA device"):
+        model_module.resolve_attention_backend("paged", "cpu")

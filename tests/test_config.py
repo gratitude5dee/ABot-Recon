@@ -47,3 +47,16 @@ def test_attention_backend_is_validated():
 def test_confidence_threshold_is_validated(threshold):
     with pytest.raises(ValueError, match="confidence_threshold"):
         InferenceConfig(confidence_threshold=threshold)
+
+def test_quantization_defaults_to_disabled_and_accepts_int8_on_cpu():
+    assert InferenceConfig().quantization == "none"
+    assert InferenceConfig(device="cpu", quantization="int8_dynamic").quantization == (
+        "int8_dynamic"
+    )
+
+
+def test_quantization_rejects_unknown_modes_and_non_cpu_devices():
+    with pytest.raises(ValueError, match="quantization must be one of"):
+        InferenceConfig(device="cpu", quantization="int4")
+    with pytest.raises(ValueError, match="requires device='cpu'"):
+        InferenceConfig(device="cuda", quantization="int8_dynamic")
