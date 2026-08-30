@@ -63,6 +63,17 @@ pip install torch==2.5.1 torchvision==0.20.1 \
 pip install -e .
 ```
 
+### Jetson (aarch64) install
+
+The wheels above are x86-only, and `pip install -e .` on a Jetson resolves the `torch==` pin to the CPU-only PyPI `linux_aarch64` wheel, replacing a working JetPack CUDA build. Install a CUDA-capable aarch64 torch first, then:
+
+```bash
+python scripts/setup_jetson_env.py --dry-run   # show the pip plan
+python scripts/setup_jetson_env.py
+```
+
+Run inference with `--attention-backend sdpa` there: it is a pure-PyTorch path, so neither FlashInfer nor a compiled cuRoPE is required. See [docs/unitree-g1-orin.md](docs/unitree-g1-orin.md).
+
 ### Recommended acceleration
 
 ABot-Recon uses paged KV-cache operators from FlashInfer when they are available and falls back to PyTorch SDPA otherwise. Compiling cuRoPE further accelerates rotary position encoding.
@@ -206,7 +217,18 @@ python scripts/export_reconstruction_ply.py \
   --bev-output outputs/demo/trajectory_bev.png
 ```
 
-This creates an RGB point-cloud PLY and a separate BEV trajectory PNG.
+This creates an RGB point-cloud PLY and a separate BEV trajectory PNG. The PLY is `binary_little_endian` with `float x/y/z` + `uchar red/green/blue` vertices, which browser viewers can parse directly.
+
+## Robot capture
+
+`scripts/record_g1_camera.py` records a Unitree G1 head-camera clip into an `--image-dir` on the robot's Jetson Orin. It needs only `unitree_sdk2py` and `cyclonedds==0.10.2` — not this package — and is read-only: it subscribes to an image topic and never publishes or commands the robot.
+
+```bash
+python record_g1_camera.py --output-dir /tmp/g1-clip --list-fields   # confirm the topic
+python record_g1_camera.py --output-dir /tmp/g1-clip --fps 10 --max-seconds 30
+```
+
+[docs/unitree-g1-orin.md](docs/unitree-g1-orin.md) covers the whole path: safety preconditions, recording, transfer, on-Orin vs off-board reconstruction, export, and cleanup.
 
 ## Evaluation
 
