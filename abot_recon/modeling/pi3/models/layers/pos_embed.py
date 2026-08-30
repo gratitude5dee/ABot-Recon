@@ -110,21 +110,23 @@ def interpolate_pos_embed(model, checkpoint_model):
 _ROPE2D_BACKEND = os.environ.get("ABOT_RECON_ROPE2D_BACKEND", "auto").lower()
 if _ROPE2D_BACKEND not in {"auto", "cuda", "torch"}:
     raise ValueError("ABOT_RECON_ROPE2D_BACKEND must be one of: auto, cuda, torch")
+# cuRoPE2D dispatches to its own PyTorch implementation for CPU tensors and
+# when the extension is missing, so it stays importable everywhere.
 RoPE2D = None
 if _ROPE2D_BACKEND != "torch":
-    try:
-        from ..curope import cuRoPE2D
-        RoPE2D = cuRoPE2D
-    except ImportError:
-        pass
-if _ROPE2D_BACKEND == "cuda" and RoPE2D is None:
-    raise ImportError("ABOT_RECON_ROPE2D_BACKEND=cuda requires the compiled cuRoPE2D extension")
+    from ..curope import cuRoPE2D, kernels_available
 
-if RoPE2D is None:
-    if _ROPE2D_BACKEND == "auto":
+    if _ROPE2D_BACKEND == "cuda" and not kernels_available():
+        raise ImportError(
+            "ABOT_RECON_ROPE2D_BACKEND=cuda requires the compiled cuRoPE2D extension"
+        )
+    if not kernels_available():
         print(
             "Warning, cannot find cuda-compiled version of RoPE2D, using a slow pytorch version instead"
         )
+    RoPE2D = cuRoPE2D
+
+if RoPE2D is None:
 
     class RoPE2D(torch.nn.Module):
         

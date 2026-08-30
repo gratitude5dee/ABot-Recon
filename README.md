@@ -88,6 +88,35 @@ python setup.py build_ext --inplace
 cd -
 ```
 
+### CPU inference
+
+The model also runs without a GPU. On CPU the rotary encoding uses the pure-PyTorch RoPE2D path, attention resolves to PyTorch SDPA (FlashInfer is CUDA-only), and autocast stays disabled, so `--amp-dtype fp32` is the only meaningful precision.
+
+```bash
+python demo.py \
+  --image-dir examples/images \
+  --device cpu \
+  --no-loop-closure
+
+# optional dynamic INT8 for the camera decoder and prediction heads
+python demo.py --image-dir examples/images --device cpu --quantize --no-loop-closure
+```
+
+```python
+model = ABotRecon.from_pretrained("acvlab/ABot-Recon", device="cpu", amp_dtype="fp32")
+```
+
+CPU throughput is orders of magnitude below the H100 baseline of 24.45 FPS. Measured at 504×280 on 8 cores of an Intel Xeon Platinum 8559C, 12 frames, loop closure disabled:
+
+| Mode | Throughput | Peak RSS |
+|---|---|---|
+| `--device cpu` (FP32) | ~0.31 FPS (~3.2 s/frame) | ~10 GiB |
+| `--device cpu --quantize` | ~0.32 FPS | ~10 GiB, ~0.4 GiB less resident weight memory |
+
+`--quantize` applies `torch.ao.quantization.quantize_dynamic` (INT8, Linear only) to the camera decoder, the global-point decoder and all prediction heads; it is rejected on non-CPU devices. Its benefit is weight memory, not throughput: CPU time is dominated by the FP32 DINOv2 encoder and the shared decoder blocks. Against the FP32 CPU baseline on the same 12 frames it shifts trajectory translation by 2.1 mm mean / 3.8 mm max ATE (2.3 mm RMSE over a 63 mm trajectory), rotation by 0.68° mean / 1.06° max, local point maps by 0.6% relative L2 and confidence by 0.8% relative L2.
+
+The DINOv2 encoder, the shared streaming decoder blocks, `point_decoder` and `conf_decoder` deliberately stay FP32: INT8 there moves local point maps by ~100% relative L2 and confidence by ~50%, which is not usable geometry.
+
 ## Model checkpoint
 
 The released checkpoint is available on [Hugging Face](https://huggingface.co/acvlab/ABot-Recon) and [ModelScope](https://modelscope.cn/models/amap_cvlab/ABot-Recon). The Python API and demo download it automatically from Hugging Face and reuse the local cache. For offline inference, download the checkpoint manually and place it at:
@@ -255,6 +284,14 @@ ABOT_RECON_CHECKPOINT=checkpoints/abot_recon.safetensors \
 ABOT_RECON_IMAGE_DIR=examples/images \
 ABOT_RECON_DEVICE=cuda \
 pytest -q tests/integration/test_real_checkpoint.py
+```
+
+The CPU tests in that file (FP32 and INT8) need no GPU and run with the same environment variables:
+
+```bash
+ABOT_RECON_CHECKPOINT=checkpoints/abot_recon.safetensors \
+ABOT_RECON_IMAGE_DIR=examples/images \
+pytest -q tests/integration/test_real_checkpoint.py -k cpu
 ```
 
 ## Release status

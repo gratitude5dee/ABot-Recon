@@ -373,7 +373,8 @@ class Pi3(nn.Module):
             print(f"[Pi3] Load checkpoints from {ckpt}: {res}", flush=True)
 
             del checkpoint
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         else:
             print("[Pi3] model.ckpt is None — no pretrained file load.", flush=True)
 
@@ -622,7 +623,7 @@ class Pi3(nn.Module):
             conf_hidden = self.conf_decoder(hidden, xpos=pos)
         camera_hidden = self.camera_decoder(hidden, xpos=pos)
 
-        with torch.amp.autocast(device_type="cuda", enabled=False):
+        with torch.amp.autocast(device_type=hidden.device.type, enabled=False):
             point_hidden = point_hidden.float()
             ret = self.point_head(
                 [point_hidden[:, self.patch_start_idx :]], (H, W)

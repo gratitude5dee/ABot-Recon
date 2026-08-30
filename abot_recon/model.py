@@ -41,9 +41,13 @@ def flashinfer_available() -> bool:
         return False
 
 
-def resolve_attention_backend(requested: str) -> str:
+def resolve_attention_backend(requested: str, device: str = "cuda") -> str:
     """Resolve auto to paged when possible; explicit paged never falls back."""
     if requested == "sdpa":
+        return "sdpa"
+    if torch.device(device).type != "cuda":
+        if requested == "paged":
+            raise RuntimeError(f"attention_backend='paged' requires a CUDA device, got {device!r}")
         return "sdpa"
     available = flashinfer_available()
     if requested == "paged" and not available:
@@ -64,6 +68,42 @@ def disable_unavailable_packaged_flash_attention(model: torch.nn.Module) -> int:
     return disabled
 
 
+# Dynamic INT8 covers the camera decoder and every prediction head. The DINOv2
+# encoder, the shared streaming decoder blocks, ``point_decoder`` and
+# ``conf_decoder`` stay in FP32: INT8 there moves the local point maps by a
+# relative L2 of ~1.0 and the confidence maps by ~0.5 against the FP32 CPU
+# baseline, whereas the modules below cost <1% on both.
+QUANTIZED_SUBMODULES = (
+    "camera_decoder",
+    "global_points_decoder",
+    "point_head",
+    "conf_head",
+    "global_point_head",
+    "camera_head",
+)
+
+
+def quantize_dynamic_int8(network: torch.nn.Module) -> int:
+    """Replace Linear layers of the decoders/heads with dynamic INT8 ones.
+
+    Returns the number of quantized Linear layers.
+    """
+    from torch.ao.nn.quantized.dynamic import Linear as quantized_linear
+    from torch.ao.quantization import quantize_dynamic
+
+    quantized = 0
+    for name in QUANTIZED_SUBMODULES:
+        submodule = getattr(network, name, None)
+        if submodule is None:
+            continue
+        replacement = quantize_dynamic(submodule, {torch.nn.Linear}, dtype=torch.qint8)
+        setattr(network, name, replacement)
+        quantized += sum(
+            1 for module in replacement.modules() if isinstance(module, quantized_linear)
+        )
+    return quantized
+
+
 class ReleasedABotReconModel(torch.nn.Module):
     """Thin runtime wrapper around the checkpoint-exact inference network."""
 
@@ -72,7 +112,7 @@ class ReleasedABotReconModel(torch.nn.Module):
         from .modeling.streaming.network import ABotReconNetwork
 
         confidence = checkpoint_has_prefix(config.checkpoint, ("conf_decoder.", "conf_head."))
-        self.attention_backend = resolve_attention_backend(config.attention_backend)
+        self.attention_backend = resolve_attention_backend(config.attention_backend, config.device)
         device = torch.device(config.device)
         with device, torch.no_grad():
             self.network = ABotReconNetwork(
@@ -111,10 +151,14 @@ class ReleasedABotReconModel(torch.nn.Module):
         )
         self.config = config
         self.device_name = config.device
+        self.device_type = torch.device(config.device).type
         self.compute_dtype = _torch_dtype(config.amp_dtype)
         # The network is constructed directly on its execution device above.
         load_model_checkpoint(self.network, config.checkpoint)
         self.eval()
+        self.quantized_linear_layers = 0
+        if config.quantization == "int8_dynamic":
+            self.quantized_linear_layers = quantize_dynamic_int8(self.network)
 
     def reset(self) -> None:
         manager = getattr(self.network, "_paged_manager", None)
@@ -133,7 +177,7 @@ class ReleasedABotReconModel(torch.nn.Module):
             tensor = tensor.unsqueeze(0).unsqueeze(0)
             yield tensor.to(
                 device=self.device_name,
-                dtype=self.compute_dtype if self.device_name.startswith("cuda") else torch.float32,
+                dtype=self.compute_dtype if self.device_type == "cuda" else torch.float32,
                 non_blocking=True,
             )
 
@@ -157,13 +201,10 @@ class ReleasedABotReconModel(torch.nn.Module):
             output_keys.append("points")
         if output_confidence:
             output_keys.append("conf")
-        autocast_enabled = (
-            self.device_name.startswith("cuda") and self.compute_dtype != torch.float32
-        )
-        device_type = "cuda" if self.device_name.startswith("cuda") else "cpu"
+        autocast_enabled = self.device_type == "cuda" and self.compute_dtype != torch.float32
         try:
             with torch.autocast(
-                device_type=device_type,
+                device_type=self.device_type,
                 dtype=self.compute_dtype,
                 enabled=autocast_enabled,
             ):
@@ -185,6 +226,7 @@ class ReleasedABotReconModel(torch.nn.Module):
 
         result = {"camera_poses": frames_only(output["camera_poses"])}
         result["attention_backend"] = self.attention_backend
+        result["quantization"] = self.config.quantization
         if output_local_points or output_world_points:
             result["local_points"] = frames_only(output.get("local_points"))
         if output_world_points:

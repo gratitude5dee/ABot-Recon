@@ -28,6 +28,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--amp-dtype", choices=("fp32", "fp16", "bf16"), default="bf16")
     parser.add_argument("--attention-backend", choices=("auto", "paged", "sdpa"), default="auto")
+    parser.add_argument(
+        "--quantize",
+        action="store_const",
+        const="int8_dynamic",
+        default="none",
+        dest="quantization",
+        help="dynamic INT8 decoders/heads on CPU (lower memory, some accuracy loss)",
+    )
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end", type=int)
@@ -113,6 +121,7 @@ def main(argv=None) -> None:
         device=args.device,
         amp_dtype=args.amp_dtype,
         attention_backend=args.attention_backend,
+        quantization=args.quantization,
         max_frames=args.max_frames,
         output_local_points=save_local_points,
         output_world_points=save_world_points,

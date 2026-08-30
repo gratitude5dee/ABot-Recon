@@ -17,6 +17,7 @@ class InferenceConfig:
     local_window_frames: int = 12
     max_frames: int = 22_000
     attention_backend: str = "auto"
+    quantization: str = "none"
     output_local_points: bool = True
     output_world_points: bool = False
     output_confidence: bool = True
@@ -31,6 +32,10 @@ class InferenceConfig:
             raise ValueError("amp_dtype must be one of: fp32, fp16, bf16")
         if self.attention_backend not in {"auto", "paged", "sdpa"}:
             raise ValueError("attention_backend must be one of: auto, paged, sdpa")
+        if self.quantization not in {"none", "int8_dynamic"}:
+            raise ValueError("quantization must be one of: none, int8_dynamic")
+        if self.quantization != "none" and not self.device.startswith("cpu"):
+            raise ValueError("quantization='int8_dynamic' requires device='cpu'")
         if self.height <= 0 or self.width <= 0:
             raise ValueError("height and width must be positive")
         if self.local_window_frames != 12:

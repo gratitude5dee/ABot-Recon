@@ -30,13 +30,20 @@ def flashinfer_available() -> bool:
     return _FLASHINFER_AVAILABLE
 
 
+def _flashinfer_usable(device: torch.device) -> bool:
+    """FlashInfer kernels are CUDA-only, so CPU always uses gather + SDPA."""
+    return _FLASHINFER_AVAILABLE and torch.device(device).type == "cuda"
+
+
 class PagedKVCacheManager:
     """Paged K/V storage for the model's fixed causal window.
 
     The release constructor fixes the inactive compatibility fields to zero;
     only ``local_window_frames`` contributes visible history. ``force_fp32``
     is retained as a validation path that gathers the visible pages and runs
-    PyTorch SDPA instead of a FlashInfer kernel.
+    PyTorch SDPA instead of a FlashInfer kernel. That same path is selected
+    automatically on non-CUDA devices and whenever FlashInfer is missing, so
+    the paging logic itself stays available on CPU.
     """
 
     def __init__(
@@ -68,12 +75,6 @@ class PagedKVCacheManager:
                 f"num_summary_tokens must be in [0, tpf={tpf}], got {num_summary_tokens}"
             )
 
-        if not force_fp32 and not _FLASHINFER_AVAILABLE:
-            raise RuntimeError(
-                "flashinfer is not installed. Install with `pip install flashinfer-python` "
-                "or pass force_fp32=True for the debug gather+SDPA path."
-            )
-
         self.num_layers = int(num_layers)
         self.tpf = int(tpf)
         self.page_size = int(tpf)  # one full frame per page
@@ -85,7 +86,7 @@ class PagedKVCacheManager:
         self.memory_mode = memory_mode
         self.max_summary_frames = max(0, int(max_summary_frames))
         self.device = device
-        self.force_fp32 = bool(force_fp32)
+        self.force_fp32 = bool(force_fp32) or not _flashinfer_usable(device)
         self.storage_dtype = torch.float32 if self.force_fp32 else dtype
 
         # ── Page pool sizing ────────────────────────────────────────────────
